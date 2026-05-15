@@ -1,0 +1,9 @@
+.env
+__pycache__/
+*.pyc
+debug_screenshot.png
+linkedin_debug.png
+login_debug.png
+scrape_job_104_org.py
+scrape_linkedin_org.py
+debug_linkedin.py
