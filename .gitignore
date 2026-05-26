@@ -7,3 +7,11 @@ login_debug.png
 scrape_job_104_org.py
 scrape_linkedin_org.py
 debug_linkedin.py
+
+# 爬蟲輸出 / 備份
+Crawl_output/
+*.xlsx
+*_backup_*.py
+screen_snapshots/
+medication-reminder-ui/
+SaaS外商清單.xlsx

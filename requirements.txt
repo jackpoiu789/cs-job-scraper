@@ -1,7 +1,6 @@
-playwright
-pandas
-openpyxl
-python-dotenv
-requests
-beautifulsoup4
-lxml
+streamlit>=1.32.0
+plotly>=5.18.0
+yfinance>=0.2.36
+pandas>=2.0.0
+numpy>=1.26.0
+requests>=2.31.0
