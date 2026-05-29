@@ -17,6 +17,12 @@ from datetime import datetime, timedelta
 
 warnings.filterwarnings('ignore')
 
+try:
+    from streamlit_autorefresh import st_autorefresh as _st_autorefresh
+    _HAS_AUTOREFRESH = True
+except ImportError:
+    _HAS_AUTOREFRESH = False
+
 TODAY = datetime.today()
 
 SECTORS = {
@@ -146,65 +152,64 @@ MARKET_SUFFIX: dict[str, str] = {'上市': '.TW', '上櫃': '.TWO', '興櫃': '.
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
-def fetch_market_stocks(market: str) -> dict[str, str]:
-    """抓取指定市場完整股票清單，回傳 {代號: 公司名稱}（快取 24 小時）。
-    資料來源：證交所 ISIN 查詢網站（Big5 HTML 表格）。"""
-    mode_map = {'上市': '2', '上櫃': '4', '興櫃': '5'}
-    url = f"https://isin.twse.com.tw/isin/C_public.jsp?strMode={mode_map.get(market,'2')}"
-    try:
-        resp = _req.get(url, timeout=20, headers={'User-Agent': 'Mozilla/5.0'})
-        resp.encoding = 'big5'
-        from io import StringIO
-        tables = pd.read_html(StringIO(resp.text))
-        result: dict[str, str] = {}
-        for _, row in tables[0].iterrows():
-            cell = str(row.iloc[0])
-            if '　' in cell:          # 全形空格分隔「代號　名稱」
-                code, _, name = cell.partition('　')
-                code = code.strip(); name = name.strip()
-                if code.isdigit() and 4 <= len(code) <= 5 and name:
-                    result[code] = name
-        return result
-    except Exception:
-        return {}
+def fetch_all_stocks() -> dict[str, tuple[str, str]]:
+    """一次抓取上市、上櫃、興櫃完整清單，回傳 {代號: (公司名稱, suffix)}。
+    suffix: '.TW'（上市）或 '.TWO'（上櫃/興櫃）。上市優先，避免重複代號被覆蓋。"""
+    from io import StringIO
+    markets = [('2', '.TW'), ('4', '.TWO'), ('5', '.TWO')]
+    result: dict[str, tuple[str, str]] = {}
+    for mode, suffix in markets:
+        url = f"https://isin.twse.com.tw/isin/C_public.jsp?strMode={mode}"
+        try:
+            resp = _req.get(url, timeout=20, headers={'User-Agent': 'Mozilla/5.0'})
+            resp.encoding = 'big5'
+            tables = pd.read_html(StringIO(resp.text))
+            for _, row in tables[0].iterrows():
+                cell = str(row.iloc[0])
+                if '　' in cell:
+                    code, _, name = cell.partition('　')
+                    code = code.strip(); name = name.strip()
+                    if code.isdigit() and 4 <= len(code) <= 5 and name:
+                        if code not in result:      # 上市優先
+                            result[code] = (name, suffix)
+        except Exception:
+            continue
+    return result
 
 
 def fuzzy_resolve(raw: str,
-                  extra_stocks: dict[str, str] | None = None,
-                  suffix: str = '.TW') -> list[tuple[str, str]]:
-    """輸入股票代號或名稱，回傳 [(name, full_ticker), ...] 候選清單。
-    extra_stocks: fetch_market_stocks 的回傳值，用於全市場搜尋。
-    suffix: '.TW'（上市）或 '.TWO'（上櫃/興櫃）。
-    上櫃/興櫃（suffix='.TWO'）時完全不查 SECTORS，只查 extra_stocks。"""
+                  all_stocks: dict[str, tuple[str, str]] | None = None,
+                  ) -> list[tuple[str, str]]:
+    """輸入股票代號或名稱，回傳 [(name, full_ticker), ...]。
+    all_stocks: fetch_all_stocks() 回傳值 {代號: (名稱, suffix)}。"""
     raw = raw.strip()
     if not raw:
         return []
-    use_sectors = (suffix == '.TW')          # 只有上市才搜 SECTORS pre-defined 清單
-    code = raw.upper().replace('.TW', '').replace('.TWO', '').strip()
+    code = raw.upper().replace('.TWO', '').replace('.TW', '').strip()
 
     if code.isdigit():
-        if use_sectors:
-            t = code + '.TW'
-            if t in TICKER_TO_NAME:
-                return [(TICKER_TO_NAME[t], t)]
-        # 查完整市場清單（extra_stocks）
-        if extra_stocks and code in extra_stocks:
-            return [(extra_stocks[code], code + suffix)]
-        # 完全未知 → 直接組 ticker，讓 yfinance 自行判斷
-        return [(code, code + suffix)]
+        # 先查 SECTORS 預定義（上市常用股）
+        t = code + '.TW'
+        if t in TICKER_TO_NAME:
+            return [(TICKER_TO_NAME[t], t)]
+        # 查合併市場清單
+        if all_stocks and code in all_stocks:
+            name, suffix = all_stocks[code]
+            return [(name, code + suffix)]
+        # 未知代號 → 預設 .TW，讓 yfinance 判斷
+        return [(code, code + '.TW')]
 
     # 名稱模糊比對
     low  = raw.lower()
     seen: set[str] = set()
     hits: list[tuple[str, str]] = []
-    if use_sectors:
-        for n, t in NAME_TO_TICKER.items():
-            if low in n.lower():
-                c = t.replace('.TW', '').replace('.TWO', '')
-                if c not in seen:
-                    hits.append((n, t)); seen.add(c)
-    if extra_stocks:
-        for c, n in extra_stocks.items():
+    for n, t in NAME_TO_TICKER.items():
+        if low in n.lower():
+            c = t.replace('.TWO', '').replace('.TW', '')
+            if c not in seen:
+                hits.append((n, t)); seen.add(c)
+    if all_stocks:
+        for c, (n, suffix) in all_stocks.items():
             if low in n.lower() and c not in seen:
                 hits.append((n, c + suffix)); seen.add(c)
     hits.sort(key=lambda x: (not x[0].startswith(raw), x[0]))
@@ -307,13 +312,59 @@ def fetch_fundamentals(ticker: str) -> dict:
         return {}
 
 
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_cashflow_roe(ticker: str) -> dict:
+    """取得年度 OCF / FCF（億元）及 ROE（%），最多近 4 年。"""
+    try:
+        tk  = yf.Ticker(ticker)
+        out = {'roe': None, 'ocf': {}, 'fcf': {}}
+
+        roe = tk.info.get('returnOnEquity')
+        if roe is not None:
+            out['roe'] = round(float(roe) * 100, 1)
+
+        cf = tk.cashflow
+        if cf is None or cf.empty:
+            return out
+
+        def _row(df, *kws):
+            for idx in df.index:
+                s = str(idx).lower().replace(' ', '').replace('_', '')
+                if all(k in s for k in kws):
+                    return df.loc[idx]
+            return None
+
+        ocf_row = _row(cf, 'operating', 'cashflow')
+        if ocf_row is None:
+            ocf_row = _row(cf, 'totalcashfromoperatingactivities')
+        capex_row = _row(cf, 'capital', 'expenditure')
+        if capex_row is None:
+            capex_row = _row(cf, 'capitalexpenditures')
+
+        if ocf_row is not None:
+            for date in cf.columns[:4]:
+                val = ocf_row.get(date)
+                if pd.isna(val):
+                    continue
+                yr = str(date.year)
+                out['ocf'][yr] = round(float(val) / 1e8, 1)
+                if capex_row is not None:
+                    cap = capex_row.get(date)
+                    if not pd.isna(cap):
+                        out['fcf'][yr] = round((float(val) + float(cap)) / 1e8, 1)
+
+        return out
+    except Exception:
+        return {}
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_ownership_ratio(ticker: str) -> dict:
     """抓取外資持股比率（僑外法人／本國持股）。
     來源：鉅亨網 (cnyes.com) 個股頁面 foreignStockOwnRatio 欄位，每日更新。
     ETF 或無資料個股回傳空 dict。
     本國持股 = 100 - 外資，含自然人＋法人；細項分拆需 TWSE 月報，目前無公開 JSON API。"""
-    code = ticker.replace('.TW', '').replace('.TWO', '').strip()
+    code = ticker.replace('.TWO', '').replace('.TW', '').strip()
     result: dict[str, float] = {}
     try:
         r = _req.get(
@@ -336,52 +387,338 @@ def fetch_ownership_ratio(ticker: str) -> dict:
     return result
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def _fetch_t86_day(date_str: str) -> dict | None:
-    """T86：單一交易日所有上市股票三大法人資料。
-    回傳 {股號: {外資, 投信, 自營商, 三大合計}}，單位：張。
-    原 TWT38U 端點回傳的是各機構明細（row[0]=空白），不是日期時序，已廢棄。"""
-    url = (f"https://www.twse.com.tw/rwd/zh/fund/T86"
-           f"?response=json&selectType=ALLBUT0999&date={date_str}")
+def fetch_realtime_quotes(tickers: list[str]) -> list[dict]:
+    """TWSE / OTC MIS 即時報價 (mis.twse.com.tw)。
+    tickers 格式：['2330.TW', '3481.TWO', 't00.TW'(加權指數), 'o00.TWO'(櫃買指數)]
+    市場時間 09:00-13:30 有即時價，盤後顯示最後成交價。"""
+    if not tickers:
+        return []
+    ch_parts = []
+    for tk in tickers:
+        if tk.endswith('.TWO'):
+            code = tk[:-4]
+            ch_parts.append(f'otc_{code}.tw')
+        else:
+            code = tk.replace('.TW', '')
+            ch_parts.append(f'tse_{code}.tw')
+    url = ("https://mis.twse.com.tw/stock/api/getStockInfo.jsp"
+           f"?ex_ch={'|'.join(ch_parts)}&json=1&delay=0")
     try:
-        resp = _req.get(url, timeout=10, headers={'User-Agent': 'Mozilla/5.0'})
+        resp = _req.get(url, timeout=8,
+                        headers={'User-Agent': 'Mozilla/5.0',
+                                 'Referer': 'https://mis.twse.com.tw/'})
         data = resp.json()
-        if data.get('stat') != 'OK' or not data.get('data'):
-            return None
-        result = {}
-        for row in data['data']:
+        results = []
+        for item in data.get('msgArray', []):
             try:
-                sid = row[0].strip()
-                if not sid or not sid.isdigit():
-                    continue
-                def _p(v):
-                    s = str(v).replace(',', '').strip()
-                    return int(s) if s and s not in ('--', '') else 0
-                # T86 欄位：[0]代號 [1]名稱
-                # [2][3][4] 外資及陸資(不含外資自營商) 買進/賣出/買賣超
-                # [5][6][7] 外資自營商 買進/賣出/買賣超
-                # [8][9][10] 投信 買進/賣出/買賣超
-                # [11..16] 自營商自行+避險
-                # [-1] 三大法人買賣超合計
-                fii   = _p(row[4])    # 外資(不含外資自營商)-買賣超
-                trust = _p(row[10])   # 投信-買賣超
-                total = _p(row[-1])   # 三大合計
-                result[sid] = {
-                    '外資':     int(fii   / 1000),
-                    '投信':     int(trust / 1000),
-                    '自營商':   int((total - fii - trust) / 1000),
-                    '三大合計': int(total / 1000),
-                }
+                def _f(key):
+                    v = item.get(key, '-')
+                    return float(v) if v not in ('-', '', None) else None
+                price = _f('z')   # 成交（即時）
+                # z 暫無成交（兩筆交易間隔 / 盤前盤後）→ 用最佳買進首價估算
+                if price is None:
+                    bids = item.get('b', '-')
+                    if bids and bids not in ('-', ''):
+                        first_bid = bids.split('_')[0].strip()
+                        try:
+                            price = float(first_bid) if first_bid else None
+                        except (ValueError, TypeError):
+                            price = None
+                prev    = _f('y')   # 昨收
+                chg     = round(price - prev, 2)       if price and prev else None
+                chg_pct = round(chg / prev * 100, 2)   if chg and prev   else None
+                vol_raw = item.get('v', '-')
+                results.append({
+                    '代號':      item.get('c', ''),
+                    '名稱':      item.get('n', ''),
+                    '現價':      price,
+                    '昨收':      prev,
+                    '漲跌':      chg,
+                    '漲跌%':     chg_pct,
+                    '開盤':      _f('o'),
+                    '最高':      _f('h'),
+                    '最低':      _f('l'),
+                    '成交量(張)': int(float(vol_raw)) if vol_raw not in ('-', '', None) else None,
+                })
             except Exception:
                 continue
-        return result if result else None
+        # 興櫃 fallback：.TWO 股票若 TWSE MIS 無即時成交價，改用 TPEx GETQ20
+        twse_priced = {r['代號'] for r in results if r.get('現價') is not None}
+        for tk in tickers:
+            if not tk.endswith('.TWO'):
+                continue
+            code = tk[:-4]
+            if code in twse_priced:
+                continue
+            eq = fetch_emerging_quote(code)
+            if eq:
+                results = [r for r in results if r['代號'] != code]
+                results.append(eq)
+        return results
+    except Exception:
+        return []
+
+
+def fetch_emerging_quote(stock_id: str) -> dict | None:
+    """TPEx 興櫃即時報價 (mis.tpex.org.tw/Quote.asmx/GETQ20)。
+    stock_id: 純4碼代號，例如 '6892'。無資料時回傳 None。"""
+    try:
+        import xml.etree.ElementTree as ET
+        resp = _req.post(
+            'https://mis.tpex.org.tw/Quote.asmx/GETQ20',
+            data={'SymbolID': stock_id},
+            timeout=8,
+            verify=False,           # TPEx 憑證缺 Subject Key Identifier，需停用驗證
+            headers={
+                'User-Agent': 'Mozilla/5.0',
+                'Content-Type': 'application/x-www-form-urlencoded',
+                'Referer': 'https://mis.tpex.org.tw/',
+            },
+        )
+        root = ET.fromstring(resp.text)
+
+        def _tag(name):
+            for el in root.iter():
+                if el.tag.split('}')[-1] == name:
+                    return el.text.strip() if el.text else None
+            return None
+
+        def _f(name):
+            v = _tag(name)
+            try:
+                return float(v) if v else None
+            except (ValueError, TypeError):
+                return None
+
+        price = _f('TradePrice')
+        prev  = _f('PreAverage')   # 前日均價（相當於昨收）
+        if not price and not prev:
+            return None            # 非交易時間或代號不存在
+
+        chg     = round(price - prev, 2)       if price and prev else None
+        chg_pct = round(chg / prev * 100, 2)   if chg and prev   else None
+
+        vol_lots = None
+        vol_raw = _tag('TradeStatisticTtlVol')
+        if vol_raw:
+            try:
+                vol_lots = round(int(float(vol_raw)) / 1000)  # 股 → 張
+            except (ValueError, TypeError):
+                pass
+
+        return {
+            '代號':      stock_id,
+            '名稱':      '',
+            '現價':      price,
+            '昨收':      prev,
+            '漲跌':      chg,
+            '漲跌%':     chg_pct,
+            '開盤':      _f('TradeStatisticOpen'),
+            '最高':      _f('TradeStatisticHigh'),
+            '最低':      _f('TradeStatisticLow'),
+            '成交量(張)': vol_lots,
+        }
+    except Exception:
+        return None
+
+
+def calc_risk_metrics(df: pd.DataFrame,
+                      benchmark_df: pd.DataFrame | None = None) -> dict:
+    """計算個股風險指標：年化波動率、最大回撤、Beta（需要 benchmark_df）。"""
+    if df is None or len(df) < 20:
+        return {}
+    returns = df['Close'].pct_change().dropna()
+    vol    = float(returns.std() * np.sqrt(252) * 100)
+    cummax = df['Close'].cummax()
+    max_dd = float(((df['Close'] - cummax) / cummax * 100).min())
+    result = {'年化波動率': round(vol, 1), '最大回撤': round(max_dd, 1)}
+    if benchmark_df is not None and len(benchmark_df) >= 20:
+        bmk_r   = benchmark_df['Close'].pct_change().dropna()
+        aligned = pd.concat([returns, bmk_r], axis=1, join='inner').dropna()
+        aligned.columns = ['s', 'b']
+        if len(aligned) >= 20 and aligned['b'].var() > 0:
+            result['Beta'] = round(
+                float(aligned['s'].cov(aligned['b']) / aligned['b'].var()), 2)
+    return result
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_monthly_revenue(ticker: str) -> pd.DataFrame | None:
+    """FinMind 月營收（近24個月）。
+    回傳 DataFrame(月份, 當月(億), MoM%, YoY%) 或 None。"""
+    code  = ticker.replace('.TWO', '').replace('.TW', '')
+    start = (TODAY - timedelta(days=760)).strftime('%Y-%m-%d')
+    try:
+        resp = _req.get(
+            'https://api.finmindtrade.com/api/v4/data',
+            params={'dataset': 'TaiwanStockMonthRevenue',
+                    'data_id': code, 'start_date': start},
+            timeout=10,
+            headers={'User-Agent': 'Mozilla/5.0'},
+        )
+        records = resp.json().get('data', [])
+    except Exception:
+        return None
+    if not records:
+        return None
+
+    rows = []
+    for rec in records:
+        try:
+            yr  = int(rec['revenue_year'])
+            mo  = int(rec['revenue_month'])
+            rev = float(rec['revenue'])
+            if rev <= 0:
+                continue
+            rows.append({
+                '月份':    f"{yr}/{mo:02d}",
+                '_sort':   yr * 100 + mo,
+                '_rev':    rev,
+                '當月(億)': round(rev / 1e8, 2),
+            })
+        except Exception:
+            continue
+
+    if not rows:
+        return None
+
+    df_rev = (pd.DataFrame(rows)
+              .drop_duplicates('月份')
+              .sort_values('_sort')
+              .reset_index(drop=True))
+
+    rev_s = df_rev['_rev']
+    df_rev['MoM(%)'] = rev_s.pct_change(1).mul(100).round(1)
+    df_rev['YoY(%)'] = rev_s.pct_change(12).mul(100).round(1)
+
+    result = (df_rev
+              .drop(columns=['_sort', '_rev'])
+              .tail(24)
+              .reset_index(drop=True))
+    return result if len(result) >= 3 else None
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def _fetch_margin_day_ok(date_str: str) -> dict:
+    """TWSE MI_MARGN 單日快取，失敗拋 ValueError（不被快取）。"""
+    url = (f"https://www.twse.com.tw/rwd/zh/marginTrading/MI_MARGN"
+           f"?response=json&date={date_str}&selectType=STOCK")
+    resp = _req.get(url, timeout=10, headers={'User-Agent': 'Mozilla/5.0'})
+    data = resp.json()
+    if data.get('stat') != 'OK':
+        raise ValueError('no data')
+
+    # API 回傳 tables 陣列；欄位名稱因 encoding 全為亂碼，固定用位置索引：
+    # [0]=代號, [5]=融資今日餘額, [6]=融資前日餘額
+    # [11]=融券今日餘額, [12]=融券前日餘額
+    tables = data.get('tables', [])
+    table  = next((t for t in tables if t.get('data')), None)
+    if not table:
+        raise ValueError('no table')
+    rows = table['data']
+
+    def _p(v):
+        try:
+            return int(str(v).replace(',', ''))
+        except Exception:
+            return 0
+
+    result = {}
+    for row in rows:
+        try:
+            sid = str(row[0]).strip()
+            if not sid or not sid.isdigit() or len(row) < 14:
+                continue
+            today_f = _p(row[5])
+            prev_f  = _p(row[6])
+            today_s = _p(row[11])
+            prev_s  = _p(row[12])
+            result[sid] = {
+                '融資餘額': today_f,
+                '融資增減': today_f - prev_f,
+                '融券餘額': today_s,
+                '融券增減': today_s - prev_s,
+            }
+        except Exception:
+            continue
+    if not result:
+        raise ValueError('empty')
+    return result
+
+
+def _fetch_margin_day(date_str: str) -> dict | None:
+    try:
+        return _fetch_margin_day_ok(date_str)
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_margin_history(ticker: str, n_days: int = 60) -> pd.DataFrame | None:
+    """個股融資融券歷史（近 n_days 個交易日，上市股票）。v2"""
+    stock_id = ticker.replace('.TWO', '').replace('.TW', '')
+    rows, checked = [], 0
+    for delta in range(1, n_days * 3):
+        if len(rows) >= n_days or checked > n_days + 60:
+            break
+        day = TODAY - timedelta(days=delta)
+        if day.weekday() >= 5:
+            continue
+        checked += 1
+        day_data = _fetch_margin_day(day.strftime('%Y%m%d'))
+        if not day_data or stock_id not in day_data:
+            continue
+        rows.append({'日期': day, **day_data[stock_id]})
+    if not rows:
+        return None
+    return pd.DataFrame(rows).sort_values('日期').reset_index(drop=True)
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def _fetch_t86_day_ok(date_str: str) -> dict:
+    """T86 單日快取：單次 HTTP 請求，假日/無資料拋 ValueError（不被快取）。"""
+    url = (f"https://www.twse.com.tw/rwd/zh/fund/T86"
+           f"?response=json&selectType=ALLBUT0999&date={date_str}")
+    resp = _req.get(url, timeout=10, headers={'User-Agent': 'Mozilla/5.0'})
+    data = resp.json()
+    if data.get('stat') != 'OK' or not data.get('data'):
+        raise ValueError('no data')     # 假日或無資料：拋例外，Streamlit 不快取
+    result = {}
+    def _p(v):
+        s = str(v).replace(',', '').strip()
+        return int(s) if s and s not in ('--', '') else 0
+    for row in data.get('data', []):
+        try:
+            sid = row[0].strip()
+            if not sid or not sid.isdigit():
+                continue
+            fii   = _p(row[4])
+            trust = _p(row[10])
+            total = _p(row[-1])
+            result[sid] = {
+                '外資':     int(fii   / 1000),
+                '投信':     int(trust / 1000),
+                '自營商':   int((total - fii - trust) / 1000),
+                '三大合計': int(total / 1000),
+            }
+        except Exception:
+            continue
+    if not result:
+        raise ValueError('empty result')  # 解析全失敗：也不快取
+    return result
+
+
+def _fetch_t86_day(date_str: str) -> dict | None:
+    """單次請求取 T86 一日資料；失敗不快取，下次可重試。"""
+    try:
+        return _fetch_t86_day_ok(date_str)
     except Exception:
         return None
 
 
 def get_inst_nd(ticker: str, n: int = 5) -> dict:
     """取近 n 個交易日三大法人買賣超合計（張），找不到資料時回空 dict"""
-    stock_id = ticker.replace('.TW', '').replace('.TWO', '')
+    stock_id = ticker.replace('.TWO', '').replace('.TW', '')
     totals   = {'外資': 0, '投信': 0, '自營商': 0, '三大合計': 0}
     found    = 0
     for delta in range(1, 30):          # 最多往回 30 個日曆日
@@ -402,7 +739,7 @@ def get_inst_nd(ticker: str, n: int = 5) -> dict:
 def get_inst_streak(ticker: str, min_streak: int = 3, max_check: int = 10) -> list[str]:
     """檢查近期法人是否連續同方向買賣超。
     回傳警示字串清單，例如 ['🔥外資連買4日', '🔴投信連賣3日']"""
-    stock_id = ticker.replace('.TW', '').replace('.TWO', '')
+    stock_id = ticker.replace('.TWO', '').replace('.TW', '')
     daily: dict[str, list[int]] = {'外資': [], '投信': [], '三大合計': []}
     found = 0
     for delta in range(1, 40):
@@ -445,7 +782,7 @@ def get_inst_streak(ticker: str, min_streak: int = 3, max_check: int = 10) -> li
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_institutional(ticker: str, days: int = 60) -> pd.DataFrame | None:
     """三大法人時序（使用 T86 逐日快取彙整，上市股票）"""
-    stock_id = ticker.replace('.TW', '').replace('.TWO', '')
+    stock_id = ticker.replace('.TWO', '').replace('.TW', '')
     rows, checked = [], 0
     for delta in range(1, days * 3):    # 最多往回找 days×3 個日曆日
         if len(rows) >= days or checked > days + 60:
@@ -868,19 +1205,9 @@ def _run_app():
             st.rerun()
         st.caption(f"資料日期：{TODAY.strftime('%Y-%m-%d')}\n資料來源：Yahoo Finance / TWSE")
 
-    _tc, _mc = st.columns([7, 3])
-    _tc.title("📈 台股熱門產業監控")
-    with _mc:
-        st.write("")   # 垂直對齊用
-        market = st.selectbox(
-            "市場別", ['上市', '上櫃', '興櫃'],
-            key='market_select',
-            help="上市（TWSE .TW）／上櫃（TPEx .TWO）／興櫃（Emerging .TWO）",
-        )
-    mkt_suffix = MARKET_SUFFIX[market]
-    mkt_is_listed = (market == '上市')    # 是否為上市（T86 法人資料支援）
-    with st.spinner(f"載入{market}股票清單…"):
-        mkt_stocks = fetch_market_stocks(market)   # {code: name}
+    st.title("📈 台股熱門產業監控")
+    with st.spinner("載入股票清單…"):
+        all_stocks = fetch_all_stocks()   # {代號: (名稱, suffix)}
 
     # ── 啟動警示面板 ──────────────────────────────────────────────
     if st.session_state.watchlist and not st.session_state.get('alerts_dismissed'):
@@ -906,9 +1233,9 @@ def _run_app():
                     st.warning(f"{a['icon']} {msg}")
             st.divider()
 
-    tab0, tab1, tab2, tab3, tab4, tab5 = st.tabs(
+    tab0, tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
         ["🌐 大盤概覽", "🏭 產業熱度", "🔍 個股查詢",
-         "⭐ 自選清單", "🏦 籌碼面板", "🎯 條件選股"]
+         "⭐ 自選清單", "🏦 籌碼面板", "🎯 條件選股", "⚡ 即時行情"]
     )
 
     # ── Tab 0：大盤概覽 ───────────────────────────────────────────
@@ -942,17 +1269,12 @@ def _run_app():
                 m4.metric("均線排列",  "多頭 ✅" if ma_bull else "空頭 ❌")
                 m5.metric("市場溫度",  temp_label)
                 st.caption("市場溫度依加權指數 RSI：< 30 極低迷 / 30-45 偏冷 / 45-60 中性 / 60-70 偏熱 / > 70 過熱")
-                st.plotly_chart(make_chart(df_twii, "加權指數 (^TWII)"), width='stretch')
+                st.plotly_chart(make_chart(df_twii, "加權指數 (^TWII)"), width='stretch', key='twii_chart')
 
     # ── Tab 1：產業熱度 ───────────────────────────────────────────
     with tab1:
-        if not mkt_is_listed:
-            st.warning(
-                f"⚠️ 產業熱度功能目前僅涵蓋預設的**上市**股票清單（台灣50＋中型100為骨幹），"
-                f"無法對應「{market}」市場。\n\n"
-                "請切換回「上市」使用此功能，或至 **個股查詢** Tab 直接搜尋上櫃／興櫃個股。"
-            )
-        else:
+        st.caption("產業熱度分析以預設上市股票清單（台灣50＋中型100為骨幹）為基礎。")
+        if True:
             col_a, col_b = st.columns(2)
             top_n = col_a.slider("顯示熱門產業數", 1, 5, 3)
             top_m = col_b.slider("每產業顯示股票數", 1, 5, 3)
@@ -985,32 +1307,26 @@ def _run_app():
                                  f"RSI {stock['RSI']}　KD_K {stock['KD_K']} / KD_D {stock['KD_D']}")
                         with st.expander(label, expanded=True):
                             st.plotly_chart(make_chart(stock["_df"], f"{stock['公司']} ({stock['代號']})"),
-                                            width='stretch')
+                                            width='stretch', key=f"sector_{stock['代號']}")
 
     # ── Tab 2：個股查詢 ───────────────────────────────────────────
     with tab2:
-        # 市場切換時清除上次查詢結果，避免顯示不同市場的舊資料
-        if st.session_state.get('t2_market') != market:
-            st.session_state.pop('t2_ticker', None)
-            st.session_state.pop('t2_name',   None)
-            st.session_state['t2_market'] = market
-
         c1, c2, c3 = st.columns([3, 1, 1])
         code_input = c1.text_input(
             "股票代號或名稱",
-            placeholder=f"例如：{'2330 或 台積電' if mkt_is_listed else '3481 或 群創'}",
+            placeholder="例如：2330 或 台積電、6892 或 台寶生醫",
             label_visibility='collapsed', key="t2_code",
         )
         search_btn = c2.button("🔍 查詢",    type="primary", key="t2_search")
         add_btn    = c3.button("⭐ 加入自選", key="t2_add")
 
-        # 模糊比對（傳入完整市場清單 + 後綴）
+        # 模糊比對（傳入合併市場清單，自動判斷 suffix）
         ticker = name = None
         if code_input.strip():
-            candidates = fuzzy_resolve(code_input.strip(), extra_stocks=mkt_stocks, suffix=mkt_suffix)
+            candidates = fuzzy_resolve(code_input.strip(), all_stocks=all_stocks)
             if len(candidates) == 0:
                 raw_in = code_input.strip()
-                ticker = raw_in if '.' in raw_in else raw_in + mkt_suffix
+                ticker = raw_in if '.' in raw_in else raw_in + '.TW'
                 name   = TICKER_TO_NAME.get(ticker, raw_in)
             elif len(candidates) == 1:
                 name, ticker = candidates[0]
@@ -1039,6 +1355,7 @@ def _run_app():
         if active_ticker:
             with st.spinner(f"載入 {active_name}…"):
                 df       = fetch(active_ticker, days)
+                df_bench = fetch('^TWII', days)
                 div_info = fetch_dividend_info(active_ticker)
                 fund     = fetch_fundamentals(active_ticker)
 
@@ -1050,7 +1367,7 @@ def _run_app():
                 ret_1m = (price / float(df['Close'].iloc[-20]) - 1) * 100
                 v      = signal_verdict(df)
 
-                code_disp = active_ticker.replace('.TW', '').replace('.TWO', '')
+                code_disp = active_ticker.replace('.TWO', '').replace('.TW', '')
                 st.subheader(f"{active_name}（{code_disp}）　{v['評估']}")
                 m1, m2, m3, m4, m5, m6, m7 = st.columns(7)
                 m1.metric("股價",  f"{price:.1f}")
@@ -1068,9 +1385,9 @@ def _run_app():
                 if v['警示'] != "—":
                     st.warning(f"警示：{v['警示']}")
 
-                # 三大法人：僅上市支援
+                # 三大法人：上市（.TW）才支援
                 st.divider()
-                if mkt_is_listed:
+                if active_ticker.endswith('.TW'):
                     inst_n = st.radio("法人觀察天數", [3, 5, 10], index=1,
                                       horizontal=True, key="t2_inst_n")
                     with st.spinner("載入法人資料…"):
@@ -1086,7 +1403,7 @@ def _run_app():
                     else:
                         st.caption("暫無法人資料（可能為假日或非交易日）")
                 else:
-                    st.caption(f"⚠️ 三大法人資料僅支援上市（TWSE）股票，{market}股票不提供此資訊。")
+                    st.caption("⚠️ 三大法人資料僅支援上市（TWSE）股票，此股為上櫃／興櫃，不提供法人資訊。")
 
                 # 持股結構（外資 vs 本國）
                 st.divider()
@@ -1108,7 +1425,7 @@ def _run_app():
                         height=280, margin=dict(t=40, b=5, l=5, r=5),
                         showlegend=False,
                     )
-                    st.plotly_chart(fig_own, width='stretch')
+                    st.plotly_chart(fig_own, width='stretch', key='own_pie_t2')
                     st.caption("⚠️ 本國持股含自然人＋法人，細項分拆需 TWSE 月報（目前無公開 JSON API）")
                 else:
                     st.caption("持股比例資料暫不可用（ETF 或無資料個股）")
@@ -1121,7 +1438,195 @@ def _run_app():
                         fsuffix = "%" if "率" in key else ""
                         col.metric(key, f"{val}{fsuffix}")
 
-                st.plotly_chart(make_chart(df, f"{active_name} ({code_disp}) — 技術分析"), width='stretch')
+                # ── 現金流量 & ROE ─────────────────────────────────
+                with st.spinner("載入現金流量資料…"):
+                    cf_data = fetch_cashflow_roe(active_ticker)
+
+                has_roe = cf_data.get('roe') is not None
+                has_cf  = bool(cf_data.get('ocf'))
+                if has_roe or has_cf:
+                    st.divider()
+                    st.caption("💰 現金流量 & 股東權益報酬率（年度）")
+
+                    roe_col, chart_col = st.columns([1, 3])
+                    with roe_col:
+                        roe_val = cf_data.get('roe')
+                        if roe_val is not None:
+                            roe_delta = "優異 ✅" if roe_val >= 15 else ("正常" if roe_val >= 8 else "偏低 ⚠️")
+                            st.metric("ROE（TTM）", f"{roe_val:.1f}%", delta=roe_delta,
+                                      delta_color="off")
+                        else:
+                            st.metric("ROE（TTM）", "—")
+                        st.caption("≥15% 優異｜8–15% 正常｜<8% 偏低")
+
+                    with chart_col:
+                        if has_cf:
+                            ocf_d = cf_data['ocf']
+                            fcf_d = cf_data.get('fcf', {})
+                            years = sorted(ocf_d.keys())
+                            ocf_v = [ocf_d[y] for y in years]
+                            fcf_v = [fcf_d.get(y) for y in years]
+                            has_fcf_data = any(v is not None for v in fcf_v)
+                            fcf_plot = [v if v is not None else 0 for v in fcf_v]
+
+                            def _yoy(vals):
+                                result = [None]
+                                for i in range(1, len(vals)):
+                                    p, c = vals[i - 1], vals[i]
+                                    if p is not None and c is not None and p != 0:
+                                        result.append(round((c - p) / abs(p) * 100, 1))
+                                    else:
+                                        result.append(None)
+                                return result
+
+                            yoy_ocf = _yoy(ocf_v)
+                            yoy_fcf = _yoy(fcf_plot) if has_fcf_data else []
+
+                            # 主軸（億元）範圍：最大值 * 1.3 留空間給文字標籤
+                            all_bar = [v for v in ocf_v + fcf_plot if v is not None]
+                            bar_max = max(all_bar) if all_bar else 1
+                            bar_min = min(all_bar) if all_bar else 0
+                            y1_max = bar_max * 1.3 if bar_max > 0 else bar_max * 0.7
+                            y1_min = bar_min * 1.3 if bar_min < 0 else 0
+
+                            # 次軸（YoY%）範圍：上下各加 45% + 10 留空間給文字
+                            all_yoy = [v for v in yoy_ocf + yoy_fcf if v is not None]
+                            if all_yoy:
+                                yoy_max = max(all_yoy)
+                                yoy_min = min(all_yoy)
+                                # 讓 YoY 折線浮在圖表上方 ~20% 區域：
+                                # 頂端貼近資料最高點，底端拉低使總範圍 = 資料跨度的 5 倍
+                                yoy_span = max(abs(yoy_max - yoy_min), 30)
+                                y2_max = yoy_max + yoy_span * 0.6
+                                y2_min = y2_max - yoy_span * 5
+                            else:
+                                y2_max, y2_min = 200, -600
+
+                            fig_cf = make_subplots(specs=[[{"secondary_y": True}]])
+
+                            fig_cf.add_trace(go.Bar(
+                                name='OCF 營業現金流',
+                                x=years, y=ocf_v,
+                                marker_color=['#1a3a6b' if v >= 0 else '#e74c3c' for v in ocf_v],
+                                text=[f"{v:.1f}" for v in ocf_v],
+                                textposition='outside',
+                                cliponaxis=False,
+                            ), secondary_y=False)
+
+                            if has_fcf_data:
+                                fig_cf.add_trace(go.Bar(
+                                    name='FCF 自由現金流',
+                                    x=years, y=fcf_plot,
+                                    marker_color=['#3498db' if v >= 0 else '#e67e22' for v in fcf_plot],
+                                    text=[f"{v:.1f}" for v in fcf_plot],
+                                    textposition='outside',
+                                    cliponaxis=False,
+                                ), secondary_y=False)
+
+                            # OCF YoY：黃色，文字在上方
+                            fig_cf.add_trace(go.Scatter(
+                                name='OCF YoY%',
+                                x=years, y=yoy_ocf,
+                                mode='lines+markers+text',
+                                line=dict(color='#f1c40f', width=2, dash='dot'),
+                                marker=dict(size=7, color='#f1c40f'),
+                                text=[f"{v:.1f}%" if v is not None else "" for v in yoy_ocf],
+                                textposition='top center',
+                                textfont=dict(color='#f1c40f', size=11),
+                            ), secondary_y=True)
+
+                            # FCF YoY：紅色，文字在下方（避免與 OCF YoY 重疊）
+                            if has_fcf_data and yoy_fcf:
+                                fig_cf.add_trace(go.Scatter(
+                                    name='FCF YoY%',
+                                    x=years, y=yoy_fcf,
+                                    mode='lines+markers+text',
+                                    line=dict(color='#e74c3c', width=2, dash='dot'),
+                                    marker=dict(size=7, color='#e74c3c'),
+                                    text=[f"{v:.1f}%" if v is not None else "" for v in yoy_fcf],
+                                    textposition='bottom center',
+                                    textfont=dict(color='#e74c3c', size=11),
+                                ), secondary_y=True)
+
+                            fig_cf.update_yaxes(title_text="億元",
+                                                range=[y1_min, y1_max], secondary_y=False)
+                            fig_cf.update_yaxes(title_text="年增率 %", ticksuffix="%",
+                                                range=[y2_min, y2_max], secondary_y=True)
+                            fig_cf.update_layout(
+                                title=dict(text="年度現金流量（億元）｜右軸：年增率%",
+                                           x=0, y=0.97, xanchor='left'),
+                                barmode='group', height=360,
+                                margin=dict(t=50, b=70, l=5, r=5),
+                                legend=dict(orientation='h', yanchor='top', y=-0.18, x=0),
+                            )
+                            st.plotly_chart(fig_cf, width='stretch', key='cf_bar_t2')
+                        else:
+                            st.caption("現金流量資料不足（ETF 或 yfinance 無此股資料）")
+
+                # ── 風險指標 ──────────────────────────────────────────
+                risk = calc_risk_metrics(df, df_bench)
+                if risk:
+                    st.divider()
+                    st.caption("⚠️ 風險指標（基於近期歷史資料）")
+                    r1, r2, r3 = st.columns(3)
+                    r1.metric("年化波動率", f"{risk['年化波動率']:.1f}%")
+                    r2.metric("最大回撤",   f"{risk['最大回撤']:.1f}%")
+                    if 'Beta' in risk:
+                        b      = risk['Beta']
+                        blabel = "高波動" if b > 1.2 else ("低波動" if b < 0.8 else "同步大盤")
+                        r3.metric("Beta（對大盤）", f"{b:.2f}",
+                                  delta=blabel, delta_color="off")
+
+                # ── 月營收趨勢 ─────────────────────────────────────────
+                with st.expander("📅 月營收趨勢（公開資訊觀測站）", expanded=False):
+                    with st.spinner("載入月營收資料…"):
+                        rev_df = fetch_monthly_revenue(active_ticker)
+                    if rev_df is not None:
+                        fig_rev = make_subplots(specs=[[{"secondary_y": True}]])
+                        fig_rev.add_trace(go.Bar(
+                            x=rev_df['月份'], y=rev_df['當月(億)'],
+                            name='當月營收(億)',
+                            marker_color='#2980b9',
+                            text=[f"{v:.1f}" for v in rev_df['當月(億)']],
+                            textposition='outside', cliponaxis=False,
+                        ), secondary_y=False)
+                        yoy_vals = rev_df['YoY(%)'].tolist()
+                        if any(v is not None for v in yoy_vals):
+                            fig_rev.add_trace(go.Scatter(
+                                x=rev_df['月份'], y=rev_df['YoY(%)'],
+                                name='YoY(%)',
+                                mode='lines+markers+text',
+                                line=dict(color='#e74c3c', width=2, dash='dot'),
+                                marker=dict(size=7, color='#e74c3c'),
+                                text=[f"{v:.1f}%" if v is not None else ""
+                                      for v in yoy_vals],
+                                textposition='top center',
+                                textfont=dict(color='#e74c3c', size=10),
+                            ), secondary_y=True)
+                        rev_max  = max(rev_df['當月(億)']) * 1.3
+                        all_yoy  = [v for v in yoy_vals if v is not None]
+                        if all_yoy:
+                            yoy_span = max(abs(max(all_yoy) - min(all_yoy)), 20)
+                            y2_max   = max(all_yoy) + yoy_span * 0.5
+                            y2_min   = y2_max - yoy_span * 5
+                        else:
+                            y2_max, y2_min = 50, -150
+                        fig_rev.update_yaxes(title_text="億元",
+                                             range=[0, rev_max], secondary_y=False)
+                        fig_rev.update_yaxes(title_text="YoY %",
+                                             range=[y2_min, y2_max], secondary_y=True)
+                        fig_rev.update_layout(
+                            title=dict(text="月營收（億元）｜右軸：YoY%",
+                                       x=0, y=0.97),
+                            barmode='group', height=320,
+                            margin=dict(t=50, b=60, l=5, r=5),
+                            legend=dict(orientation='h', yanchor='top', y=-0.2, x=0),
+                        )
+                        st.plotly_chart(fig_rev, width='stretch', key='rev_chart_t2')
+                    else:
+                        st.caption("月營收資料無法取得（ETF、興櫃或 MOPS 暫時無資料）")
+
+                st.plotly_chart(make_chart(df, f"{active_name} ({code_disp}) — 技術分析"), width='stretch', key='tech_chart_t2')
 
                 # 訊號歷史勝率回測
                 with st.expander("📊 訊號歷史勝率回測", expanded=False):
@@ -1185,7 +1690,7 @@ def _run_app():
                 ))
                 fig_pnl.update_layout(title="各持倉浮盈/虧（%）", height=280,
                                       margin=dict(t=40, b=5, l=5, r=5))
-                st.plotly_chart(fig_pnl, width='stretch')
+                st.plotly_chart(fig_pnl, width='stretch', key='pnl_bar_t3')
 
                 # 產業佔比 Pie chart
                 sec_alloc = pf_df.groupby('產業')['市值(元)'].sum()
@@ -1194,7 +1699,7 @@ def _run_app():
                 ))
                 fig_pie.update_layout(title="持倉產業分布（市值）", height=320,
                                       margin=dict(t=40, b=5, l=5, r=5))
-                st.plotly_chart(fig_pie, width='stretch')
+                st.plotly_chart(fig_pie, width='stretch', key='alloc_pie_t3')
                 st.divider()
 
             # ── 多股走勢比較 ────────────────────────────────────────
@@ -1235,9 +1740,38 @@ def _run_app():
                     hovermode='x unified',
                     legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
                 )
-                st.plotly_chart(fig_cmp, width='stretch')
+                st.plotly_chart(fig_cmp, width='stretch', key='cmp_chart_t3')
             elif len(sel_labels) == 1:
                 st.info("請再多選一支以上的股票才能比較")
+
+            # ── 持倉相關係數矩陣 ─────────────────────────────────────
+            if len(wl_tickers) >= 2:
+                st.markdown("##### 📊 持倉相關係數矩陣（近90日）")
+                price_dict: dict[str, pd.Series] = {}
+                for tk, nm in zip(wl_tickers, wl_names):
+                    df_c = fetch(tk, 90)
+                    if df_c is not None:
+                        price_dict[nm] = df_c['Close']
+                if len(price_dict) >= 2:
+                    corr_df = pd.DataFrame(price_dict).corr().round(2)
+                    n = len(corr_df)
+                    fig_corr = go.Figure(go.Heatmap(
+                        z=corr_df.values,
+                        x=list(corr_df.columns),
+                        y=list(corr_df.index),
+                        colorscale='RdBu_r', zmid=0, zmin=-1, zmax=1,
+                        text=corr_df.values,
+                        texttemplate='%{text:.2f}',
+                        textfont=dict(size=12),
+                        hoverongaps=False,
+                    ))
+                    fig_corr.update_layout(
+                        height=max(280, n * 80 + 100),
+                        margin=dict(l=5, r=5, t=30, b=5),
+                    )
+                    st.plotly_chart(fig_corr, width='stretch', key='corr_heatmap_t3')
+                    st.caption("1.0 = 完全同向；0 = 無相關；-1.0 = 完全反向。"
+                               "理想分散持倉應避免相關係數 > 0.8。")
             st.divider()
 
             # 快速訊號總覽
@@ -1322,17 +1856,13 @@ def _run_app():
                 with st.spinner(f"載入 {name}…"):
                     df = fetch(ticker, days)
                 if df is not None:
-                    st.plotly_chart(make_chart(df, f"{name} — 技術分析"), width='stretch')
+                    st.plotly_chart(make_chart(df, f"{name} — 技術分析"), width='stretch', key=f"tech_wl_{ticker}")
                 else:
                     st.warning(f"無法取得 {name} 資料")
 
     # ── Tab 4：籌碼面板 ───────────────────────────────────────────
     with tab4:
-        if mkt_is_listed:
-            st.caption("資料來源：TWSE T86（三大法人資料僅涵蓋上市股票）")
-        else:
-            st.warning(f"⚠️ 目前選擇「{market}」市場：三大法人籌碼資料由 TWSE T86 提供，僅支援上市股票。"
-                       "以下功能對上櫃／興櫃股票無資料。")
+        st.caption("資料來源：TWSE T86（三大法人資料僅涵蓋上市股票；上櫃／興櫃自選股無法人資料）")
 
         # 自選股法人速覽
         if st.session_state.watchlist:
@@ -1389,7 +1919,7 @@ def _run_app():
                 m2.metric("投信近10日",    f"{_s10('投信'):+,} 張")
                 m3.metric("自營商近10日",  f"{_s10('自營商'):+,} 張")
                 m4.metric("三大合計近10日", f"{_s10('三大合計'):+,} 張")
-                st.plotly_chart(
+                st.plotly_chart(  # TODO: add key='own_pie_t4'
                     make_institutional_chart(df_inst, f"{name} ({raw}) 三大法人買賣超"),
                     width='stretch',
                 )
@@ -1418,10 +1948,48 @@ def _run_app():
                         height=280, margin=dict(t=40, b=5, l=5, r=5),
                         showlegend=False,
                     )
-                    st.plotly_chart(fig_own_t4, width='stretch')
+                    st.plotly_chart(fig_own_t4, width='stretch', key='own_pie_t4b')
                     st.caption("⚠️ 本國持股含自然人＋法人，細項分拆需 TWSE 月報（目前無公開 JSON API）")
                 else:
                     st.caption("持股比例資料暫不可用（ETF 或無資料個股）")
+
+                # ── 融資融券 ──────────────────────────────────────────
+                st.divider()
+                st.caption("💸 融資融券餘額（來源：TWSE，近60交易日，僅支援上市股票）")
+                with st.spinner("載入融資融券資料…"):
+                    mg_df = fetch_margin_history(ticker, 60)
+                if mg_df is not None:
+                    mg_last = mg_df.iloc[-1]
+                    mc1, mc2, mc3, mc4 = st.columns(4)
+                    mc1.metric("融資餘額(張)", f"{int(mg_last['融資餘額']):,}")
+                    mc2.metric("融資增減(張)", f"{int(mg_last['融資增減']):+,}")
+                    mc3.metric("融券餘額(張)", f"{int(mg_last['融券餘額']):,}")
+                    mc4.metric("融券增減(張)", f"{int(mg_last['融券增減']):+,}")
+                    fig_mg = make_subplots(
+                        rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08,
+                        subplot_titles=['融資餘額（張）', '融券餘額（張）'],
+                    )
+                    fig_mg.add_trace(go.Scatter(
+                        x=mg_df['日期'], y=mg_df['融資餘額'],
+                        mode='lines', line=dict(color='#e74c3c', width=2),
+                        showlegend=False,
+                    ), row=1, col=1)
+                    fig_mg.add_trace(go.Scatter(
+                        x=mg_df['日期'], y=mg_df['融券餘額'],
+                        mode='lines', line=dict(color='#2980b9', width=2),
+                        showlegend=False,
+                    ), row=2, col=1)
+                    fig_mg.update_layout(
+                        height=400, hovermode='x unified',
+                        margin=dict(l=5, r=5, t=50, b=5),
+                    )
+                    st.plotly_chart(fig_mg, width='stretch', key='margin_chart_t4')
+                    with st.expander("📋 融資融券完整資料", expanded=False):
+                        df_mg_show = mg_df.copy()
+                        df_mg_show['日期'] = df_mg_show['日期'].dt.strftime('%Y-%m-%d')
+                        st.dataframe(df_mg_show, width='stretch', hide_index=True)
+                else:
+                    st.caption("融資融券資料暫不可用（假日、非交易日或上櫃股票）")
 
     # ── Tab 5：條件選股 ───────────────────────────────────────────
     with tab5:
@@ -1485,7 +2053,7 @@ def _run_app():
                             save_watchlist(st.session_state.watchlist)
                             st.success(f"已加入：{r['公司']}")
                         st.plotly_chart(make_chart(r["_df"], f"{r['公司']} ({r['代號']})"),
-                                        width='stretch')
+                                        width='stretch', key=f"screener_{r['代號']}")
 
         st.divider()
         st.subheader("📂 歷史篩選快照")
@@ -1504,6 +2072,370 @@ def _run_app():
                         snap = json.load(f)
                     st.caption(f"篩選時間：{snap['date']}　條件：{snap['conditions']}　共 {snap['count']} 支")
                     st.dataframe(pd.DataFrame(snap['stocks']), width='stretch', hide_index=True)
+
+
+    # ── Tab 6：即時行情 ───────────────────────────────────────────
+    with tab6:
+        # ── 自動更新控制（fragment 外；改完後整頁更新套用新間隔）──────────
+        rc1, rc2, rc3 = st.columns([2, 2, 6])
+        auto_on = rc1.toggle("自動更新", value=False, key="rt_auto_on")
+        rt_sec  = rc2.select_slider("更新間隔", [10, 15, 20, 30, 60], value=15,
+                                     format_func=lambda x: f"{x} 秒", key="rt_sec")
+        _rt_interval = rt_sec if auto_on else None
+        if auto_on:
+            rc3.success(f"✅ 每 {rt_sec} 秒自動刷新（僅此頁籤，不影響其他頁面）")
+
+        @st.fragment(run_every=_rt_interval)
+        def _rt_body():
+            st.caption(
+                f"即時價：TWSE MIS API　技術指標：前一日收盤計算　"
+                f"最後更新：{datetime.now().strftime('%H:%M:%S')}　"
+                f"交易時間：09:00–13:30"
+            )
+    
+            # ── 大盤指數 ──────────────────────────────────────────────
+            st.markdown("##### 大盤概況")
+            with st.spinner("載入指數…"):
+                idx_rt = fetch_realtime_quotes(['t00.TW', 'o00.TWO'])
+            idx_label = {'t00': '加權指數', 'o00': '櫃買指數'}
+            if idx_rt:
+                icols = st.columns(min(len(idx_rt), 4))
+                for col, item in zip(icols, idx_rt):
+                    code    = item['代號']
+                    label   = idx_label.get(code, item['名稱'] or code)
+                    price   = item['現價']
+                    chg     = item['漲跌']
+                    chg_pct = item['漲跌%']
+                    if price:
+                        delta_str = f"{chg:+.2f} ({chg_pct:+.2f}%)" if chg and chg_pct else None
+                        col.metric(label, f"{price:,.2f}", delta_str)
+                    else:
+                        col.metric(label, "—")
+            else:
+                st.caption("指數資料暫時無法取得")
+    
+            st.divider()
+    
+            # ── 自選股資料建構（即時 + EOD 技術面合併）──────────────
+            if not st.session_state.watchlist:
+                st.info("自選清單為空，請先在「個股查詢」頁面加入股票", icon="⭐")
+            else:
+                wl_tickers_rt = list(st.session_state.watchlist.keys())
+                wl_names_map  = {tk: (v['name'] if isinstance(v, dict) else v)
+                                 for tk, v in st.session_state.watchlist.items()}
+    
+                with st.spinner("載入即時報價 & 技術面…"):
+                    rt_data = fetch_realtime_quotes(wl_tickers_rt)
+                rt_map = {item['代號']: item for item in rt_data}
+    
+                table_rows = []
+                card_data  = []
+    
+                for ticker in wl_tickers_rt:
+                    name = wl_names_map.get(ticker, ticker)
+                    code = ticker.replace('.TWO', '').replace('.TW', '')
+                    rt   = rt_map.get(code, {})
+    
+                    rt_price   = rt.get('現價')
+                    rt_chg_pct = rt.get('漲跌%')
+                    rt_chg     = rt.get('漲跌')
+                    rt_vol     = rt.get('成交量(張)')
+                    prev_close = rt.get('昨收')
+    
+                    df_eod = fetch(ticker, 90)
+                    v_dict = signal_verdict(df_eod) if df_eod is not None else {}
+    
+                    rsi_val = kd_k_val = kd_d_val = None
+                    bb_pos = dist_ma5 = dist_ma20 = vol_ratio = amplitude = None
+                    bb_upper_v = bb_lower_v = bb_mid_v = None
+                    bb_pos_label = "—"
+    
+                    if df_eod is not None and len(df_eod) > 0:
+                        last_eod  = df_eod.iloc[-1]
+                        eod_close = float(last_eod['Close'])
+                        price_ref = rt_price if rt_price else eod_close
+    
+                        rsi_val  = round(float(last_eod['RSI']),  1) if not np.isnan(last_eod['RSI'])  else None
+                        kd_k_val = round(float(last_eod['KD_K']), 1)
+                        kd_d_val = round(float(last_eod['KD_D']), 1)
+                        ma5      = float(last_eod['MA5'])  if not np.isnan(last_eod['MA5'])  else None
+                        ma20     = float(last_eod['MA20']) if not np.isnan(last_eod['MA20']) else None
+                        bb_upper_v = float(last_eod['BB_upper']) if not np.isnan(last_eod['BB_upper']) else None
+                        bb_lower_v = float(last_eod['BB_lower']) if not np.isnan(last_eod['BB_lower']) else None
+                        bb_mid_v   = float(last_eod['BB_mid'])   if not np.isnan(last_eod['BB_mid'])   else None
+    
+                        if ma5:
+                            dist_ma5  = round((price_ref / ma5  - 1) * 100, 2)
+                        if ma20:
+                            dist_ma20 = round((price_ref / ma20 - 1) * 100, 2)
+                        if bb_upper_v and bb_lower_v:
+                            bb_range = bb_upper_v - bb_lower_v
+                            if bb_range > 0:
+                                bb_pos = round((price_ref - bb_lower_v) / bb_range * 100, 1)
+                                if   bb_pos > 100: bb_pos_label = "⬆ 突破上軌"
+                                elif bb_pos > 66:  bb_pos_label = "上段"
+                                elif bb_pos > 33:  bb_pos_label = "中段"
+                                elif bb_pos > 0:   bb_pos_label = "下段"
+                                else:              bb_pos_label = "⬇ 跌破下軌"
+    
+                        avg_vol_5d = df_eod['Volume'].tail(5).mean()
+                        if rt_vol and avg_vol_5d and avg_vol_5d > 0:
+                            vol_ratio = round((rt_vol * 1000) / avg_vol_5d, 2)
+    
+                    if rt.get('最高') and rt.get('最低') and prev_close and prev_close > 0:
+                        amplitude = round((rt['最高'] - rt['最低']) / prev_close * 100, 2)
+    
+                    # RSI / KD 帶狀態的標籤
+                    def _rsi_label(v):
+                        if v is None: return "—"
+                        if v < 30:   return f"{v} ⬇超賣"
+                        if v < 40:   return f"{v} 偏低"
+                        if v > 75:   return f"{v} ⬆超買"
+                        if v > 65:   return f"{v} 偏熱"
+                        return str(v)
+    
+                    def _kd_label(k, d):
+                        if k is None: return "—"
+                        tag = "⬆超買" if k > 80 else "⬇超賣" if k < 20 else ""
+                        return f"K{k}/D{d} {tag}".strip()
+    
+                    table_rows.append({
+                        '代號':    code,
+                        '名稱':    name,
+                        '現價':    rt_price if rt_price else "—",
+                        '漲跌%':   f"{rt_chg_pct:+.2f}%" if rt_chg_pct is not None else "—",
+                        '振幅%':   f"{amplitude:.2f}%" if amplitude else "—",
+                        '量比':    f"{vol_ratio:.1f}×" if vol_ratio else "—",
+                        'RSI':     _rsi_label(rsi_val),
+                        'KD':      _kd_label(kd_k_val, kd_d_val),
+                        '均線':    v_dict.get('均線', '—'),
+                        'MACD':    v_dict.get('MACD', '—'),
+                        'BB位置':  bb_pos_label,
+                        '距MA20%': f"{dist_ma20:+.2f}%" if dist_ma20 is not None else "—",
+                        '評估':    v_dict.get('評估', '—'),
+                    })
+                    card_data.append({
+                        'ticker': ticker, 'name': name, 'code': code,
+                        'rt': rt, 'df_eod': df_eod, 'v_dict': v_dict,
+                        'rsi_val': rsi_val, 'kd_k_val': kd_k_val, 'kd_d_val': kd_d_val,
+                        'bb_pos': bb_pos, 'bb_pos_label': bb_pos_label,
+                        'bb_upper': bb_upper_v, 'bb_lower': bb_lower_v, 'bb_mid': bb_mid_v,
+                        'dist_ma5': dist_ma5 if 'dist_ma5' in dir() else None,
+                        'dist_ma20': dist_ma20, 'vol_ratio': vol_ratio,
+                        'amplitude': amplitude, 'rt_chg_pct': rt_chg_pct,
+                        '_rsi_label': _rsi_label, '_kd_label': _kd_label,
+                    })
+    
+                # ── 總覽表格 ──────────────────────────────────────────
+                st.markdown("##### 自選股即時技術面總覽")
+                if table_rows:
+                    overview_df = pd.DataFrame(table_rows)
+    
+                    def _ov_style(val):
+                        s = str(val)
+                        if s.startswith('+') and ('%' in s or s[1:].replace('.','').isdigit()):
+                            return 'color: #e74c3c; font-weight: bold'
+                        if s.startswith('-') and ('%' in s or s[1:].replace('.','').isdigit()):
+                            return 'color: #27ae60; font-weight: bold'
+                        if '突破上軌' in s or '超買' in s:
+                            return 'color: #e74c3c'
+                        if '跌破下軌' in s or '超賣' in s:
+                            return 'color: #27ae60; font-weight: bold'
+                        if '🟢' in s:
+                            return 'color: #27ae60'
+                        if '🔴' in s:
+                            return 'color: #e74c3c'
+                        return ''
+    
+                    st.dataframe(
+                        overview_df.style.map(
+                            _ov_style,
+                            subset=['漲跌%', '振幅%', 'RSI', 'KD', 'BB位置', '距MA20%', '評估'],
+                        ),
+                        width='stretch', hide_index=True,
+                    )
+                st.divider()
+    
+                # ── 個股詳細卡片 ──────────────────────────────────────
+                st.markdown("##### 個股詳細卡片")
+                for card in card_data:
+                    ticker   = card['ticker']
+                    name     = card['name']
+                    code     = card['code']
+                    rt       = card['rt']
+                    df_eod   = card['df_eod']
+                    v_dict   = card['v_dict']
+                    rt_price = rt.get('現價')
+                    rt_chg   = rt.get('漲跌')
+                    chg_pct  = card['rt_chg_pct']
+    
+                    chg_icon  = "🔴" if (chg_pct or 0) >= 0 else "🟢"
+                    price_str = f"{rt_price:.2f}" if rt_price else "非交易時間"
+                    chg_str   = f" {chg_pct:+.2f}%" if chg_pct is not None else ""
+                    verdict   = v_dict.get('評估', '')
+                    exp_label = f"{name}（{code}）　{chg_icon} {price_str}{chg_str}　{verdict}"
+    
+                    with st.expander(exp_label, expanded=False):
+                        # ── 報價區 ────────────────────────────────────
+                        st.markdown("**📌 即時報價**")
+                        q1, q2, q3, q4, q5, q6 = st.columns(6)
+                        q1.metric("現價",       f"{rt_price:.2f}"      if rt_price           else "—",
+                                  f"{rt_chg:+.2f}" if rt_chg else None)
+                        q2.metric("漲跌%",      f"{chg_pct:+.2f}%"     if chg_pct is not None else "—")
+                        q3.metric("開盤",       f"{rt['開盤']:.2f}"    if rt.get('開盤')     else "—")
+                        q4.metric("最高 / 最低",
+                                  (f"{rt['最高']:.2f} / {rt['最低']:.2f}"
+                                   if rt.get('最高') and rt.get('最低') else "—"))
+                        q5.metric("成交量(張)", f"{rt['成交量(張)']:,}" if rt.get('成交量(張)') else "—")
+                        q6.metric("量比(5日均)", f"{card['vol_ratio']:.1f}×" if card['vol_ratio'] else "—")
+    
+                        if df_eod is not None:
+                            # ── 技術指標區 ────────────────────────────
+                            st.divider()
+                            st.markdown("**📊 技術指標（基於前一日收盤）**")
+                            t1, t2, t3, t4, t5, t6 = st.columns(6)
+                            rsi_v  = card['rsi_val']
+                            kd_k   = card['kd_k_val']
+                            kd_d   = card['kd_d_val']
+                            t1.metric("RSI(14)",   card['_rsi_label'](rsi_v))
+                            t2.metric("KD_K / D",  f"{kd_k} / {kd_d}" if kd_k else "—")
+                            t3.metric("KD狀態",    v_dict.get('KD狀態', '—'))
+                            t4.metric("均線排列",  v_dict.get('均線', '—'))
+                            t5.metric("MACD方向",  v_dict.get('MACD', '—'))
+                            t6.metric("綜合評估",  v_dict.get('評估', '—'))
+    
+                            # ── 位置感知區 ────────────────────────────
+                            st.divider()
+                            st.markdown("**📍 價格位置感知**")
+                            p1, p2, p3, p4 = st.columns(4)
+                            p1.metric("距MA5",    f"{card['dist_ma5']:+.2f}%"  if card.get('dist_ma5')  is not None else "—")
+                            p2.metric("距MA20",   f"{card['dist_ma20']:+.2f}%" if card['dist_ma20'] is not None else "—")
+                            p3.metric("BB帶位置", card['bb_pos_label'])
+                            p4.metric("今日振幅", f"{card['amplitude']:.2f}%"  if card['amplitude']     else "—")
+    
+                            bp = card['bb_pos']
+                            if bp is not None and card['bb_upper'] and card['bb_lower']:
+                                bp_clamped = max(0, min(100, bp))
+                                st.caption(
+                                    f"布林帶（0%=下軌 → 100%=上軌）：**{bp:.1f}%**　"
+                                    f"下軌 {card['bb_lower']:.2f} ／ 中軌 {card['bb_mid']:.2f} ／ 上軌 {card['bb_upper']:.2f}"
+                                )
+                                st.progress(bp_clamped / 100)
+    
+                            # 訊號 & 警示橫幅
+                            sig  = v_dict.get('訊號', '—')
+                            warn = v_dict.get('警示', '—')
+                            if sig  != '—': st.success(f"📈 訊號：{sig}")
+                            if warn != '—': st.warning(f"⚠️ 警示：{warn}")
+    
+                            # ── 迷你走勢圖（近20日 + BB + 即時價橫線）──
+                            df_mini     = df_eod.tail(20).copy()
+                            up_color    = '#e74c3c' if (chg_pct or 0) >= 0 else '#27ae60'
+                            fill_color  = ('rgba(231,76,60,0.08)' if (chg_pct or 0) >= 0
+                                           else 'rgba(39,174,96,0.08)')
+    
+                            fig_spark = go.Figure()
+                            # BB 帶底色
+                            fig_spark.add_trace(go.Scatter(
+                                x=df_mini.index, y=df_mini['BB_upper'],
+                                mode='lines', line=dict(color='rgba(100,100,220,0.35)', width=1),
+                                showlegend=False, hoverinfo='skip',
+                            ))
+                            fig_spark.add_trace(go.Scatter(
+                                x=df_mini.index, y=df_mini['BB_lower'],
+                                mode='lines', line=dict(color='rgba(100,100,220,0.35)', width=1),
+                                fill='tonexty', fillcolor='rgba(100,100,220,0.06)',
+                                showlegend=False, hoverinfo='skip',
+                            ))
+                            # MA20
+                            fig_spark.add_trace(go.Scatter(
+                                x=df_mini.index, y=df_mini['MA20'],
+                                mode='lines', line=dict(color='#e67e22', width=1.5, dash='dot'),
+                                name='MA20',
+                                hovertemplate='MA20 %{y:.2f}<extra></extra>',
+                            ))
+                            # MA5
+                            fig_spark.add_trace(go.Scatter(
+                                x=df_mini.index, y=df_mini['MA5'],
+                                mode='lines', line=dict(color='#3498db', width=1.5, dash='dash'),
+                                name='MA5',
+                                hovertemplate='MA5 %{y:.2f}<extra></extra>',
+                            ))
+                            # 收盤走勢（主線）
+                            fig_spark.add_trace(go.Scatter(
+                                x=df_mini.index, y=df_mini['Close'],
+                                mode='lines+markers',
+                                line=dict(color=up_color, width=2.5),
+                                marker=dict(size=4, color=up_color),
+                                fill='tozeroy', fillcolor=fill_color,
+                                name='收盤',
+                                hovertemplate='%{x|%m/%d}<br>收盤 %{y:.2f}<extra></extra>',
+                            ))
+                            # 即時價橫線
+                            if rt_price:
+                                fig_spark.add_hline(
+                                    y=rt_price, line_dash='dash',
+                                    line_color='#f39c12', line_width=1.5, opacity=0.9,
+                                    annotation_text=f"  即時 {rt_price:.2f}",
+                                    annotation_position="right",
+                                    annotation_font=dict(size=11, color='#f39c12'),
+                                )
+                            fig_spark.update_layout(
+                                title=dict(text=f"{name} — 近20日走勢（含布林帶 & MA）",
+                                           font=dict(size=13)),
+                                height=230,
+                                margin=dict(l=5, r=90, t=35, b=5),
+                                xaxis=dict(showgrid=False, tickformat='%m/%d',
+                                           tickfont=dict(size=10)),
+                                yaxis=dict(showgrid=True, gridcolor='rgba(0,0,0,0.06)'),
+                                showlegend=True,
+                                legend=dict(orientation='h', y=1.12, x=0, font=dict(size=10)),
+                                plot_bgcolor='rgba(0,0,0,0)',
+                                hovermode='x unified',
+                            )
+                            st.plotly_chart(fig_spark, width='stretch', key=f"spark_{card['code']}")
+    
+
+        _rt_body()
+        # ── 自訂即時查詢 ──────────────────────────────────────────
+        st.divider()
+        st.markdown("##### 快速查詢其他股票即時價")
+        qc1, qc2 = st.columns([4, 1])
+        rt_input = qc1.text_input(
+            "代號", label_visibility='collapsed',
+            placeholder="輸入代號，例如：2330,2317,0050（逗號分隔）",
+            key="rt_custom_input",
+        )
+        rt_query_btn = qc2.button("查詢", type="primary", key="rt_custom_btn")
+        if rt_query_btn and rt_input.strip():
+            raw_codes = [c.strip() for c in rt_input.replace('，', ',').split(',') if c.strip()]
+            custom_tickers = []
+            for c in raw_codes:
+                if '.' in c:
+                    custom_tickers.append(c)
+                elif c in all_stocks:
+                    custom_tickers.append(c + all_stocks[c][1])
+                else:
+                    custom_tickers.append(c + '.TW')
+            with st.spinner("查詢中…"):
+                custom_rt = fetch_realtime_quotes(custom_tickers)
+            if custom_rt:
+                for i in range(0, len(custom_rt), 4):
+                    chunk = custom_rt[i:i + 4]
+                    cols  = st.columns(4)
+                    for col, item in zip(cols, chunk):
+                        price   = item['現價']
+                        chg_pct = item['漲跌%']
+                        chg     = item['漲跌']
+                        iname   = item['名稱'] or item['代號']
+                        if price:
+                            delta_str = (f"{chg:+.2f} ({chg_pct:+.2f}%)"
+                                         if chg is not None and chg_pct is not None else None)
+                            col.metric(f"{iname}（{item['代號']}）", f"{price:.2f}", delta_str)
+                        else:
+                            col.metric(f"{iname}（{item['代號']}）", "無資料")
+            else:
+                st.warning("查無資料，請確認代號是否正確")
 
 
 # ── 執行入口 ──────────────────────────────────────────────────────
